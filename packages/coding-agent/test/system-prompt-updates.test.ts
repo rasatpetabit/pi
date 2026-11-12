@@ -8,9 +8,11 @@ import {
 	getCurrentSystemMessage,
 	getCurrentSystemPrompt,
 	getSystemMessageText,
+	type Model,
+	resolveTranscriptTools,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
-import { getModel } from "@earendil-works/pi-ai/compat";
+import { getModel, streamSimple } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { describe, expect, test } from "vitest";
 import { createAgentSession } from "../src/core/sdk.ts";
@@ -21,8 +23,9 @@ import {
 	buildSystemPromptState,
 	diffSystemPromptSections,
 } from "../src/core/system-prompt.ts";
+import { createToolSearchExtension } from "../src/extensions/tool-search/index.ts";
 import type { ExtensionFactory } from "../src/index.ts";
-import { createHarness } from "./suite/harness.ts";
+import { createHarness, type Harness } from "./suite/harness.ts";
 
 describe("system prompt updates", () => {
 	test("declares the prompt and tools once and reuses them across resume", async () => {
@@ -179,6 +182,192 @@ describe("system prompt updates", () => {
 				{ plan_mode: null },
 			]);
 			expect(getCurrentSystemPrompt(harness.session.messages)).toBe(harness.session.systemPrompt);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	// #10489: the forced prompt head keeps the initial tool declarations, so a tool_search
+	// discovery stays on its own later system message instead of growing the request tool
+	// list and re-billing the cached prefix on every discovery.
+	const forcedPromptFactories = (mode: "systemPrompt" | "forceSystemPrompt") => [
+		createToolSearchExtension(),
+		((pi) => {
+			pi.registerTool({
+				name: "search_docs",
+				label: "Search docs",
+				description: "Search the docs.",
+				exposure: "deferred",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [], details: {} }),
+			});
+			pi.on("before_agent_start", (event) => {
+				if (mode === "systemPrompt") return { systemPrompt: "Exact prompt." };
+				event.systemPromptOptions.forceSystemPrompt = "Exact prompt.";
+			});
+		}) satisfies ExtensionFactory,
+	];
+
+	/** Loads search_docs through a real tool_search call, then withdraws it: three requests. */
+	async function runForcedToolSearchTurns(harness: Harness): Promise<TranscriptContext[]> {
+		const requests: TranscriptContext[] = [];
+		harness.setResponses([
+			(context) => {
+				requests.push(context);
+				return fauxAssistantMessage(fauxToolCall("tool_search", { query: "search docs", limit: 1 }), {
+					stopReason: "toolUse",
+				});
+			},
+			(context) => {
+				requests.push(context);
+				return fauxAssistantMessage("loaded");
+			},
+			(context) => {
+				requests.push(context);
+				return fauxAssistantMessage("removed");
+			},
+		]);
+		await harness.session.prompt("find docs");
+		// The tool_search call and its result take one extra request round trip.
+		expect(requests).toHaveLength(2);
+		harness.session.setActiveToolsByName(["tool_search"]);
+		await harness.session.prompt("continue");
+		expect(requests).toHaveLength(3);
+		return requests;
+	}
+
+	test.each(["systemPrompt", "forceSystemPrompt"] as const)(
+		"%s keeps tool_search additions out of the forced prompt head",
+		async (mode) => {
+			const harness = await createHarness({
+				initialActiveToolNames: ["tool_search"],
+				extensionFactories: forcedPromptFactories(mode),
+			});
+			// The faux provider never opens a connection; fail loudly if any transport is attempted.
+			const originalFetch = globalThis.fetch;
+			let fetchAttempts = 0;
+			globalThis.fetch = (async () => {
+				fetchAttempts++;
+				throw new Error("network transport attempted in an offline test");
+			}) as typeof fetch;
+			try {
+				const requests = await runForcedToolSearchTurns(harness);
+				const head = requests[0]?.messages[0];
+				if (head?.role !== "system") throw new Error("expected a leading system message");
+				expect(head.content).toBe("Exact prompt.");
+				expect(head.toolsAdded?.map((tool) => tool.name)).toEqual(["tool_search"]);
+
+				// The request tool list keeps the initial declarations byte-for-byte.
+				const initial = resolveTranscriptTools(requests[0]!.messages, "additions");
+				const loaded = resolveTranscriptTools(requests[1]!.messages, "additions");
+				expect(loaded.requestTools).toEqual(initial.requestTools);
+				// The discovered tool stays anchored to its own later system message.
+				const delta = requests[1]!.messages.filter((message) => message.role === "system").at(-1);
+				expect(delta?.toolsAdded?.map((tool) => tool.name)).toEqual(["search_docs"]);
+				expect(delta?.content).toBe("");
+				expect(delta?.sections).toBeUndefined();
+				expect(requests[1]!.messages.indexOf(delta!)).toBeGreaterThan(
+					requests[1]!.messages.findIndex((message) => message.role === "toolResult"),
+				);
+				// The forced text is the effective prompt; the transcript keeps its structured sections.
+				expect(getCurrentSystemPrompt(requests[1]!.messages)).toBe("Exact prompt.");
+				expect(getCurrentSystemPrompt(harness.session.messages)).not.toBe("Exact prompt.");
+
+				// The removal survives the projection, so the withdrawn tool is not re-declared.
+				const removed = resolveTranscriptTools(requests[2]!.messages, "additions");
+				expect(removed.requestTools.map((tool) => tool.name)).toEqual(["tool_search"]);
+				const removal = requests[2]!.messages.filter((message) => message.role === "system").at(-1);
+				expect(removal?.toolsRemoved).toEqual([{ name: "search_docs" }]);
+				expect(fetchAttempts).toBe(0);
+			} finally {
+				globalThis.fetch = originalFetch;
+				harness.cleanup();
+			}
+		},
+	);
+
+	// #10489: wire-level regression. The projection is only useful if the serialized request
+	// keeps its cached prefix, so replay the captured requests through the Responses transport
+	// that declares tools in additional_tools items.
+	const additionalToolsModel: Model<"openai-responses"> = {
+		id: "gpt-responses-test",
+		name: "GPT Responses Test",
+		api: "openai-responses",
+		provider: "openai",
+		baseUrl: "http://127.0.0.1:9",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 100000,
+		maxTokens: 1000,
+		compat: { supportsMidConvoSystemMessages: true, supportsAdditionalTools: true },
+	};
+
+	interface ResponsesPayload {
+		tools?: Array<{ name: string }>;
+		input: Array<{
+			type?: string;
+			role?: string;
+			content?: string;
+			tools?: Array<{ name: string }>;
+		}>;
+	}
+
+	/** Serialize a request like the Responses transport would and capture it before any network. */
+	async function captureResponsesPayload(context: TranscriptContext): Promise<ResponsesPayload> {
+		let captured: ResponsesPayload | undefined;
+		const stream = streamSimple(additionalToolsModel, context, {
+			apiKey: "test-key",
+			onPayload: (payload) => {
+				captured = payload as ResponsesPayload;
+				throw new Error("payload captured; tests never open a transport");
+			},
+		});
+		await stream.result();
+		if (!captured) throw new Error("expected payload capture");
+		return captured;
+	}
+
+	test("a forced prompt keeps the serialized Responses prefix across tool_search changes", async () => {
+		const harness = await createHarness({
+			initialActiveToolNames: ["tool_search"],
+			extensionFactories: forcedPromptFactories("forceSystemPrompt"),
+		});
+		try {
+			const requests = await runForcedToolSearchTurns(harness);
+			const payloads = [];
+			for (const request of requests) {
+				payloads.push(await captureResponsesPayload(request));
+			}
+			const [initial, loaded, removed] = payloads;
+
+			// The leading declaration and the forced instructions are the cached prefix.
+			expect(initial.tools).toBeUndefined();
+			expect(initial.input[0]).toMatchObject({
+				type: "additional_tools",
+				tools: [expect.objectContaining({ name: "tool_search" })],
+			});
+			expect(initial.input[1]).toMatchObject({ role: "developer", content: "Exact prompt." });
+
+			// Discovery appends an additional_tools item; earlier items are byte-identical.
+			expect(loaded.input.slice(0, initial.input.length)).toEqual(initial.input);
+			expect(
+				loaded.input
+					.filter((item) => item.type === "additional_tools")
+					.map((item) => item.tools?.map((tool) => tool.name)),
+			).toEqual([["tool_search"], ["search_docs"]]);
+
+			// Removal appends its announcement; nothing earlier is rewritten and no removed
+			// tool is declared again.
+			expect(removed.input.slice(0, loaded.input.length)).toEqual(loaded.input);
+			const announcement = removed.input.find((item) => item.content?.includes("no longer available"));
+			expect(announcement?.content).toContain("- search_docs");
+			expect(
+				removed.input
+					.filter((item) => item.type === "additional_tools")
+					.map((item) => item.tools?.map((tool) => tool.name)),
+			).toEqual([["tool_search"], ["search_docs"]]);
+			expect(removed.tools).toBeUndefined();
 		} finally {
 			harness.cleanup();
 		}
